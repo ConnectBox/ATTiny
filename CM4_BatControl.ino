@@ -80,6 +80,51 @@
 *    - wake when AXP209 calls for power OR AC_IN goes high
 *    - parallel batteries of like voltage when ATTiny not in sleep mode to
 *       minimize losses due to high current through internal battery resistances.
+*       
+* Version 14:     
+*   Update and improve ver 13 to allow AXP209 primary control of power with ATTiny being
+*    used to override both power up and power down status, as follows:
+*             
+*           setup(){
+*              pinMode(VCC_OVR,OUTPUT);
+*              digitalWrite(VCC_OVR,LOW);  // force hold off
+*              powerOn = false;
+*           }
+*             
+*           check_powerUp_request(){
+*             if (powerOn==true){ return;}
+*             if (AXP_EXTEN == LOW){ return;}  // no request for change so just return
+*             else{                            // something is calling for power on
+*               if (PB_IN == HIGH){            // PB1 is NOT pushed so continue to hold off
+*                 return;
+*               }  
+*               // make sure low for 2 passes (noise) then...
+*                 digitalWrite(VCC_OVR,HIGH);  // hold on
+*                 powerOn = true;
+*               }  
+*             }
+*          }   
+*          
+*          check_powerDown_request(){
+*            if (powerOn == false){return;}   // we are off so no action 
+*                                             //   we will handle check for AXP_EXTEN == HIGH with powerOn == false in sleepy()
+*            if (AXP_EXTEN == HIGH){return;}  // no request for change so just return
+*            // else, we are powered but AXP wants to be off so PB1 has been pushed or V is below critical
+*            // set timer to wait 30 seconds and then...
+*                digitalWrite(VCC_OVR, LOW);          
+*                powerOn = false;
+*           }     
+*           
+*           check_sleepy(){
+*           // prior to going to sleep, check for special case of (AXP_EXTEN == HIGH) and (powerOn == false)
+*           //  which we get to when 5V is off and charger is off, but charger attach caused AXP_EXTEN
+*           //  to go HIGH. To fix that we need to hold the PB_IN low until AXP_EXTEN goes low. Then we
+*           //  can set the ATTiny outputs to inputs and go to sleep           
+*           
+*           // Coming out of sleep, we set VCC_OVR to OUTPUT and LOW; powerOn = false;
+*           }  
+*               
+*               
 *   
 */
 
@@ -91,7 +136,7 @@
 #include "ATTiny88_pins.h"  // the "" format looks for this file in the project directory
 
 /// VERSION NUMBER ///
-#define VERSION_NUMBER 0x13   // rev level of this code
+#define VERSION_NUMBER 0x14   // rev level of this code
 
 // I/O to sense presence of charger
 #define AC_PRESENT   PC2    // digital read AC_IN line
@@ -134,7 +179,7 @@ int battSense[4] = {PD0, PD1, PD2, PD3};    // sense for battery present (HIGH)
 #define HEARTBEAT      PC3
 #define AXP_EXTEN      PD4       // AXP209 EXTEN pin (formerly used to directly control 5V)
 #define PWR_IRQ        PD5       // signal to CM4 that power down is in process
-#define VCC_OVR         PD6       // signal controlling power to 5V converter
+#define VCC_OVR        PD6       // signal controlling power to 5V converter
 
 
 /* I2C stuff */
@@ -249,12 +294,17 @@ void loop()
 
 /*
  * heartbeat()
- *  Simple toggle of output pin to let us know the ATTiny is looping
+ *  Simple heartbeat on output pin to let us know the ATTiny is looping
  */
 void heartbeat(){
   heart += 1;
-  heart = heart %2;
-  digitalWrite(HEARTBEAT, heart);
+  heart = heart %8;       // a flicker is sufficient and uses less power
+  if (heart == 0){
+    digitalWrite(HEARTBEAT, HIGH);
+  }
+  else{
+    digitalWrite(HEARTBEAT, LOW);
+  }
  }
 
 /*
