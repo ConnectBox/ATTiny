@@ -79,6 +79,11 @@
 *      - Add case 0x34 (returns AC_on() result)
 *      - Change variable lowest_voltage start value to 1000 (was 900) (lsb now 4.6 mv, not 5 mv)
 *      
+*   Rev 0x1F by DorJamJr
+*     - Add 100 msec delay before all i2c read() and write functions ("breathe"). 
+*       This does seem to fix the i2c error where all data reads are a single constant.
+*     
+*      
 */
 
 #include <Wire.h>           // for I2C
@@ -90,7 +95,7 @@
 #include "ATTiny88_pins.h"  // the "" format looks for this file in the project directory
 
 /// VERSION NUMBER ///
-#define VERSION_NUMBER 0x1E   // rev level of this code
+#define VERSION_NUMBER 0x1F   // rev level of this code
 
 
 // Timing constants
@@ -743,13 +748,16 @@ void DataReceive(int numBytes)
 
   if (numBytes == 1){    // this is a normal request for a read
      while(Wire.available())  {
+       delay(100);        // breathe??
        rcvData = Wire.read();
     }
   }
 
   if (numBytes == 2){         // this is a register write
+    delay(100);           // breathe??
     rcvReg = Wire.read();     // the register to write
     multi[0] = rcvReg;
+    delay(100);           // breathe??
     rcvVal = Wire.read();     // the value to write
     multi[1]= rcvVal;
     rcvData = rcvReg;         // set up for possible request to retrieve the value written
@@ -827,7 +835,7 @@ void DataRequest()
 
     case 0x37:        // report time remaining in power up hold
       if (poweringDown){
-        sendData = (endPowerUpHoldTime - millis())/125;        // 1000 msec/sec / 8 (clock scaling)
+        sendData = (endPowerUpHoldTime - millis());        // 1000 msec/sec / 8 (clock scaling) (scaling removed)
       }
       else{
         sendData = 0xFF;
@@ -967,7 +975,8 @@ void DataRequest()
     default:                // Command Not Recognized
       sendData = CMD_ERROR;   
       break;
-  }  
+  } 
+  delay(100);               // breathe?? 
   Wire.write(sendData);
   //Wire.endTransmission();   // master doesn't like this... causes i2cdetect to fail...
   
