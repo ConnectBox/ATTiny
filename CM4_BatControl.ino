@@ -52,6 +52,10 @@
 *        removed or replaced.
 *     - add use of EEPROM to keep track of power state of CM4. Then use that info to restore power condition on wdt   
 *        or reload of code by avrdude
+*        
+*   Rev 0x1A by DorJamJr     
+*     - remove use of EEPROM  (broke i2c periodically !?)
+*     - use state of AXP_EXTEN to determine power on state on reboot of ATTiny (wdt or avrdude)
 *     
 *  
 */
@@ -61,12 +65,11 @@
 #include <avr/sleep.h>
 #include <avr/interrupt.h>
 #include <SoftwareSerial.h>
-//#include <EEPROM.h>
 
 #include "ATTiny88_pins.h"  // the "" format looks for this file in the project directory
 
 /// VERSION NUMBER ///
-#define VERSION_NUMBER 0x09   // rev level of this code  "19a"
+#define VERSION_NUMBER 0x1A   // rev level of this code
 
 
 // Timing constants
@@ -80,7 +83,6 @@ int ps_shutdown_delay = 20000;   // 20 sec (make int so there is an opportunity 
 const int dwellTime   = 12000;   // 12 secs nominal battery charging time (sec) (each cycle)
 int dwellAdjust  = 0;            // adjustment of dwell time to run durning unpowered charging... based on batVoltageATT[] value
 int ps_powerup_delay = 2000;     // 2 sec
-int EEpowerFlag = 0;             // location in EEPROM to save state of power (if wdt timer triggers, restore state)
 
 // Time variables to handle next decision time
 unsigned long currentTime;
@@ -161,12 +163,15 @@ void setup()
 
  // restore state of power before last reset (wdt or avrdude)
   pinMode(VCC_OVR,OUTPUT);         // control signal for 5V on/off
-//  if (EEPROM.read(EEpowerFlag) == 0){
-//    digitalWrite(VCC_OVR,LOW);      // hold power off until PB used to turn on power
-//  }
-//  else{
+  pinMode(AXP_EXTEN,INPUT);       // monitor AXP EXTEN pin for 5V power down control
+  if (digitalRead(AXP_EXTEN) == HIGH){   // AXP209 calling for power on
     digitalWrite(VCC_OVR,HIGH);   // power on
-//  } 
+    powerOn == true;              // set power on flag
+  }
+  else{
+    digitalWrite(VCC_OVR,LOW);   // power off
+    powerOn == false;            // set power on flag    
+  }
       
   sei();          // enable interrupts
 
@@ -177,9 +182,7 @@ void setup()
   pinMode(CATCH_RST,OUTPUT);
   digitalWrite(CATCH_RST,HIGH);
   
-  // 5V control signals
-  pinMode(AXP_EXTEN,INPUT);       // monitor AXP EXTEN pin for 5V power down control
-    
+  // 5V control signals    
   pinMode(PWR_IRQ,OUTPUT);        // indicator signal for 5V going down
   digitalWrite(PWR_IRQ,HIGH);     // initialize
   pinMode(PB_IN,INPUT);           // signal from pushbutton controlling power requests to AXP209
