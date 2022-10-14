@@ -69,7 +69,7 @@
 #include "ATTiny88_pins.h"  // the "" format looks for this file in the project directory
 
 /// VERSION NUMBER ///
-#define VERSION_NUMBER 0x1A   // rev level of this code
+#define VERSION_NUMBER 0x1B   // rev level of this code
 
 
 // Timing constants
@@ -123,7 +123,7 @@ int battSense[4] = {PD0, PD1, PD2, PD3};    // sense for battery present (HIGH)
 #define CATCH_RST      PC1      // debug... pulse when restart
 #define BAT_VOLTAGE    ADC0     // read the voltage on the battery(ies) in use (divider 36K, 10K => 5mV lsb)
 
-#define ENABLE_SERIAL_DEBUG
+// #define ENABLE_SERIAL_DEBUG
 #ifdef ENABLE_SERIAL_DEBUG
   #define rxPin          PB0      // pin 12... serial data in (not used... but required for SoftwareSerial)
   #define txPin          PB1      // pin 13... serial data out (for logic analyzer)
