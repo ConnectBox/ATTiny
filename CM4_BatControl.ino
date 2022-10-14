@@ -125,6 +125,11 @@
 *           }  
 *               
 *               
+* Version 15              
+*   Update of version 14 to: 
+*      - fix paralleling of equal voltage batteries
+*      - change shutdown time to 20 seconds
+*      - lockout use of pushbutton during shutdown
 *   
 */
 
@@ -136,10 +141,8 @@
 #include "ATTiny88_pins.h"  // the "" format looks for this file in the project directory
 
 /// VERSION NUMBER ///
-#define VERSION_NUMBER 0x14   // rev level of this code
+#define VERSION_NUMBER 0x15   // rev level of this code
 
-// I/O to sense presence of charger
-#define AC_PRESENT   PC2    // digital read AC_IN line
 
 // Timing constants
 // By experiment, the clock is running slow by factor of 8 (8 MHz clock with scale down of 8)
@@ -150,7 +153,7 @@
 //  we have a /8 clock so 125 counts/sec
 // minimum delay around the main loop... (25 => 200 msec)
 #define LOOP_DELAY      25      // 200 msec (not too long! remember 1 second watchdog!)
-int ps_shutdown_delay = 3750;   // 30 sec (make int so there is an opportunity to change it programatically
+int ps_shutdown_delay = 2500;   //2500 => 20 sec;  3750 => 30 sec (make int so there is an opportunity to change it programatically
 const int dwellTime = 1500;     // 1500 == 12 secs nominal battery charging time (sec) (each cycle)
 int ps_powerup_delay = 250;     // 2 sec
 
@@ -166,6 +169,8 @@ int battPresent[4] = {1,0,0,0};     // set to "1" if battery present
 int batVoltage[4] = {0, 0, 0, 0};   // Battery voltages sent from CM4; LSB = 16 mV
 int batGroup[4] = {0,0,0,0};        // if element is non-zero, indicates bat is part of a battery group
 int offDelay = 30;      // delay from AXP209 signal to power off (secs)
+int AC_off_count = 0;        // used for resetting battery readings when AC status changes
+int AC_on_count = 0;
 
 unsigned long endPowerUpHoldTime;
 int poweringDown = false;
@@ -175,12 +180,15 @@ int powerOn = false;                        // indicator that power is on (will 
 int battEna[4]   = {PA0, PA1, PA2, PA3};    // FETs to use the selected battery   
 int battSense[4] = {PD0, PD1, PD2, PD3};    // sense for battery present (HIGH)
 
+// I/O to sense presence of charger
+#define AC_PRESENT   PC2    // digital read AC_IN line
+
 // Declarations of I/O
 #define HEARTBEAT      PC3
 #define AXP_EXTEN      PD4       // AXP209 EXTEN pin (formerly used to directly control 5V)
 #define PWR_IRQ        PD5       // signal to CM4 that power down is in process
 #define VCC_OVR        PD6       // signal controlling power to 5V converter
-
+#define PB_IN          PD7       // push button in
 
 /* I2C stuff */
 #define I2C_ADDRESS 0x14      // chosen address for this code
@@ -196,6 +204,7 @@ int probe1 = 0xe1;
 int probe2 = 0xe2;
 int probe3 = 0xe3;
 int heart = 0;
+int heart_rate = 1;
 
 
 /* ----------------- SETUP ------------------------------ */
@@ -224,6 +233,7 @@ void setup()
   pinMode(VCC_OVR,INPUT);         // control signal for 5V on/off
   pinMode(PWR_IRQ,OUTPUT);        // indicator signal for 5V going down
   digitalWrite(PWR_IRQ,HIGH);     // initialize
+  pinMode(PB_IN,INPUT);           // signal from pushbutton controlling power requests to AXP209
 
   // set all sense lines to INPUTS 
   // A reading of HIGH indicates battery present, a LOW indicates battery missing (or backwards)
@@ -267,12 +277,12 @@ void loop()
   int nextBat;
 
   heartbeat();
-  check_sleepy();                   // if power is down and no charger, put ATTiny to sleep 
+  //check_sleepy();                   // if power is down and no charger, put ATTiny to sleep 
   
   checkForBatteries();              // test for presence of all batteries at top of loop and clear batVoltage[] for missing bat
   
   check_powerDown_request();        // test and begin power down when AXP EXTEN pin is low
-  check_powerUp_request();          // test for power up (check AXP_EXTENA for HIGH indicating power on)
+  check_powerUp_request();          // test for power up (check AXP_EXTEN for HIGH indicating power on)
  
   currentTime = millis();           // check if our dwell time (12 sec) is done and we need to change batteries
   if (currentTime > targetTime) {   // finished this charge/discharge cycle for current battery
@@ -299,11 +309,12 @@ void loop()
 void heartbeat(){
   heart += 1;
   heart = heart %8;       // a flicker is sufficient and uses less power
-  if (heart == 0){
+  if ((heart == 0) or ((poweringDown == true) and (heart == 2))){
     digitalWrite(HEARTBEAT, HIGH);
   }
+
   else{
-    digitalWrite(HEARTBEAT, LOW);
+    digitalWrite(HEARTBEAT, LOW);    
   }
  }
 
@@ -326,6 +337,8 @@ void check_powerDown_request(){
   if (poweringDown == false){       // just entering the power down sequence
     poweringDown = true;
     endPowerUpHoldTime = millis() + ps_shutdown_delay;    // 30 sec
+    pinMode(PB_IN,OUTPUT);
+    digitalWrite(PB_IN, LOW);     // hold PB signal low to prevent false retrigger of power up while powering down
     digitalWrite(PWR_IRQ,LOW);      // signal CM4 we are going down
   }
   
@@ -336,12 +349,14 @@ void check_powerDown_request(){
     poweringDown = false;
     digitalWrite(PWR_IRQ,HIGH);      // reset
     pinMode(VCC_OVR,INPUT);          // release for AXP209 to control next power up
+    digitalWrite(PB_IN, HIGH);      // release hold on PB_IN
+    pinMode(PB_IN, INPUT);          //  and tristate PB_IN
   }
 }
 
 /*
  * check_powerUp_request()
- *   If power is off, read the AXP_EXTENA line to see if AXP209 calling for power on
+ *   If power is off, read the AXP_EXTEN line to see if AXP209 calling for power on
  *   If power is on, just return
  */
  void check_powerUp_request(){
@@ -466,6 +481,8 @@ void checkForBatteries(){
  *       - Choose next available battery -> LOOP
  *   - IF not charging:    
  *     - Choose battery with highest voltage -> LOOP
+ *     
+ *  Note: This routine returns a single battery number BUT will return battery number +4 if eligible for multiBattery selection  
  */
 int next_bat() 
 {
@@ -474,7 +491,30 @@ int next_bat()
   int highest_voltage = 0;
   int lowest_voltage = 0xFF;
   
-   // Initial battery reading... pick next battery which is present but has no voltage reading...
+  //CM4_active = 1;  // debug
+  
+  // first handle reset of CM4_active flag 
+  if (CM4_active == 1) {
+    CM4_active = 0;
+    
+    //CM4_active = 1;   // debug
+  }
+  // if CM4 isn't active, just choose the next available battery... we don't know anything about voltages
+  else {
+    for (n=0; n<4; n++){
+      m = (n + 1 + currBat) % 4;    // choose next battery after current battery
+      if (battPresent[m]){          
+        nextBat = m; 
+        return nextBat;                              
+      } 
+    }      
+  }
+
+  // If we got here then the CM4 is active and we can read battery voltages
+  
+  // Initial battery reading... pick next battery which is present but has no voltage reading...
+  //  Note: we want JUST THIS battery to be selected since we will figure out its voltage during this cycle
+  //   and don't want the reading corrupted by parallel batteries... so return the real battery number (not +4)
   for (n=0; n<4; n++){
     m = (n + 1 + currBat) % 4;    // start with battery AFTER current battery and look through all 4 battery positions
     if (battPresent[m] && (batVoltage[m] == 0)){    // special case... battery present but not yet read by AXP209
@@ -483,61 +523,33 @@ int next_bat()
     } 
   } 
     
-  // all batteries have had their voltage read... proceed with normal selection
+  // all batteries have had their voltages read... proceed with normal selection
+  //  which will choose the lowest number battery meeting the criteria (so if equal readings,
+  //  meeting the voltage criteria (lowest/highest voltage) the lowest number battery is selected)
+  
   // check to see if we are charging
-  if (AC_on()) {               // charging... 
-    
-    // see if CM4 is active (and so we have active voltage reading of the batteries)
-    if (CM4_active == 1) {     //   with CM4 active, batVoltage[] readings are valid... so pick the lowest voltage (valid) battery
-      CM4_active = 0;          // reset CM4 heartbeat
-      for (n=0; n<4; n++) {
-        if ((batVoltage[n] < lowest_voltage) && (batVoltage[n] > 0xC1)) {  // batt > 3100 mV to be selected
-          nextBat = n;
-          lowest_voltage = batVoltage[n];
-        }  
+  if (AC_on()) {               // charging... so pick the lowest battery 
+    for (n=0; n<4; n++) {
+      if ((batVoltage[n] < lowest_voltage) && (batVoltage[n] > 0xC1)) {  // batt > 3100 mV to be selected
+        nextBat = n;
+        lowest_voltage = batVoltage[n];
       }
-    }
-    
-    // we are charging but CM4 powered down, so choose next available battery
-    else {        
-      for (n=0; n<4; n++){
-        m = (n + 1 + currBat) % 4;    // choose next battery after current battery
-        if (battPresent[m]){          
-          nextBat = m; 
-          break;                              
-        } 
-      }      
     }
   }
 
-  // we are NOT charging, but since we are here, the CM4 is powered
-  else {                              // discharging... so pick the highest voltage battery
+  else {                      // discharging, so pick the highest voltage battery
     for (n=0; n<4; n++){
       if (batVoltage[n] > highest_voltage) {
         nextBat = n;
         highest_voltage = batVoltage[n];
       }
     }
-  } 
-   
- return nextBat;  
+  }
+ // if we got here, the selection can be multiple batteries, so return nextBat +4 to signal that to batterySelect()     
+ return nextBat + 4;  
 }
 
 
-/*
- * AC_on()
- * Determine if AC_IN line is powered (ie, is charger connected) and return TRUE/FALSE
- * Vref = Vcc (about 4.35V); so LSB = 4.25mV; 4v *2.2K / (2.2K + 10K) = 0.72v;  So for 3.0V count = 127
- */
-bool AC_on()       // Verified
-{  
-  if (digitalRead(AC_PRESENT) == HIGH){
-    return true;
-  }
-  else{
-    return false;
-  }
-}
 
 
 /*
@@ -549,44 +561,94 @@ bool AC_on()       // Verified
  *  intentionally request turning OFF the current battery before turning ON 
  *  the next battery. In practice, there is still a slight overlap (usec's)
  *  of the switching due to capacitive effects of FET gates.
+ *  
+ * After turning on the FET for the selected battery, a check is made to see if other 
+ *  batteries have voltage readings within 2 counts (32 mV) of the selected batteries.
+ *  Those batteries whose voltages ARE within 2 counts will have their FETs turned ON 
+ *  and the battery number will be added to the batGroup[] array. Those batteries that are 
+ *  NOT within the two counts, will have their FETs turned OFF and their battery number
+ *  removed from the batGroup[] array. (Note that the batGroup[] array is used during 
+ *  i2c writes to the batVoltage[] array to make sure that the batteries which are part
+ *  of the batGroup[] all have the same recorded battery voltage.)
  */
-/*
- * FEATURE ADD:
- *  We want to enable all batteries that are within 2 counts (32 mV) of the selected 
- *   battery. Perhaps we can do that here? I don't think we need to be concerned with
- *   charging/discharging (we already looked at that when we chose this battery) so
- *   just check for battery readings within 2 counts of the selected battery??
- *   How will the battery readings get properly saved with CM4 doing one reading of a 
- *   group of batteries? Perhaps a new variable batGroup[] with the 4 elements representing
- *   the currently selected group? Set that var here (when we turn them on) and then
- *   take the group into account when we get a write to I2C register 0x21 - 0x24??
- */
+
  
 void batterySelect (int batt)
 {
-  noInterrupts();                     // turn off interrupts while we change FETs
-  if (batt != currBat) {
-    digitalWrite (battEna[batt], LOW);     //  turn on new battery
-    batGroup[batt] = 1;             // add new selection to batGroup[] (it may be the only one)
-    digitalWrite (battEna[currBat], HIGH); //   then turn off currBat (70 usec overlap)
-    batGroup[currBat] = 0;             // remove previous selection from batGroup[] (it may be added again)
+  int n;
+  bool grouping_ok;
+
+  probe1 = batt;        // 0x53
+  if (batt >= 4){
+    grouping_ok = true;
+    batt -= 4;    // restore actual battery number
   }
-  // else we are not changing batteries so leave status quo
-  for (int n=1; n<4; n++){
-    if (abs(batVoltage[(batt+n)%4] - batVoltage[batt]) <= 2){
-      // turn on FET and add to batGroup[] any battery within 2 counts of same voltage (32mV) 
-      batGroup[n] = 1;                  // add to group and
-      digitalWrite(battEna[n], LOW);    //  turn on FET
+  else{
+    grouping_ok = false;
+  }
+  probe2 = batt;                   // 0x55... current battery (+1) 0x34..... batGroup 0x33
+  if (grouping_ok == true){
+      probe3 = 0x12;         // 0x57
+  }
+  // clear the group
+  for (n=0;n<4;n++){
+    batGroup[n] = 0;
+  }
+  batGroup[batt] = 1;             // add new selection to batGroup[] (it may be the only one)
+
+  //grouping_ok = false;    // debug
+  
+  if (grouping_ok == true){      // the multiple battery function... 
+  probe3 += 1;           //0x57
+  // add to batGroup[] any battery equal to the same voltage (lsb = 16mV) 
+    for (n=1; n<4; n++){
+      if (batVoltage[(batt+n)%4] == batVoltage[batt]){
+        probe3 += 1;           //0x57
+        batGroup[(batt+n)%4] = 1;                  // add to group and     // 0x33
+      }
     }
-    else{
-      batGroup[n] = 0;                  // remove from group and
-      digitalWrite(battEna[n], HIGH);   //  turn off FET
+  }
+  
+  noInterrupts();                     // turn off interrupts while we change FETs
+  // turn on FETs for batteries with "1" in the batGroup[]
+  for (n=0; n<4; n++){
+    if (batGroup[n] == 1){
+      digitalWrite (battEna[n], LOW);     //  turn on battery in the batGroup[]
+    }
+  }
+  for (n=0; n<4; n++){
+    if (batGroup[n] == 0){
+      digitalWrite (battEna[n], HIGH);     //  turn off battery in the batGroup[]
     }
   }
   interrupts();                       // turn interrupts back on
   currBat = batt;                     // the FET is turned on, so now "nextBat" becomes "currBat"
 }
 
+/*
+ * AC_on()
+ * Determine if AC_IN line is powered (ie, is charger connected) and return TRUE/FALSE
+ * Vref = Vcc (about 4.35V); so LSB = 4.25mV; 4v *2.2K / (2.2K + 10K) = 0.72v;  So for 3.0V count = 127
+ */
+bool AC_on()       // Verified
+{  
+  if (digitalRead(AC_PRESENT) == HIGH){
+    AC_off_count = 0;
+    AC_on_count += 1;
+    if (AC_on_count > 10){
+      AC_on_count = 10;
+    }
+    return true;
+  }
+  else{
+    AC_on_count = 0;
+    AC_off_count += 1;
+    if (AC_off_count >10){
+      AC_off_count = 10;
+    }
+    return false;
+  }
+}
 
 
 /* I2C communication handlers 
@@ -641,13 +703,13 @@ void DataReceive(int numBytes)
     if ((rcvReg >= 0x21) && (rcvReg <= 0x24)){
       batVoltage[rcvReg - 0x21] = rcvVal;   // use value sent (lsb = 16mV)
     //  and if part of batGroup[], fill in batVoltage[] for all members of group
-      if (batGroup[rcvReg - 0x21] == 1){  
+/*      if (batGroup[rcvReg - 0x21] == 1){  
         for (int n=0; n<4; n++){        
           if (batGroup[n] == 1){
             batVoltage[n] = rcvVal;
           }
         }
-      }
+      }   */
     }
 
     
@@ -731,6 +793,22 @@ void DataRequest()
             }
       }
       break;
+    case 0x33:    // sendData = binary representation of batGroup array; bit 0 == battPresent[0], etc
+      sendData = 0;
+      for (n=0; n<4; n++){
+            sendData *= 2;    // batCoded shift left
+            if (batGroup[3-n] == true){
+              sendData += 1;
+            }
+      }
+      break;
+
+
+
+    case 0x34:                  // Current Battery
+      sendData = currBat + 1;   // (battery number is zero based)
+      break;
+
 
     case 0x36:        // power down delay register
       sendData = offDelay;    // secs
@@ -848,6 +926,11 @@ void DataRequest()
     case 0x81:
       sendData = probe >> 8;
       break;  
+
+    case 0x88:
+      sendData = probe >> 8;
+      break;  
+      
         
     default:                // Command Not Recognized
       sendData = CMD_ERROR;   
