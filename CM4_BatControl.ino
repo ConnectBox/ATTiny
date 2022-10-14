@@ -68,47 +68,74 @@
 *   hold high for time set by variable, "offDelay" (default 30 seconds). Allow user to 
 *   set variable with I2C write to address 0x36.
 *   
+* Version 13:  
+*   For use with hardware HAT_CM4 version 1.8.3
+*   This adds the following functionality: 
+*    - sense when AXP209 turns on 5V (PD4)
+*    - hardware OR of 5V enable via ATTiny PD6 to hold power on independent of AXP209 (PD6)
+*    - sense when AXP209 calls for power off (PD4)
+*    - signal CM4 power going down (PD5 drop low)
+*    - wait a specified time then drop PD6 to power 5V down
+*    - sleep when both 5V and AC_IN are down
+*    - wake when AXP209 calls for power OR AC_IN goes high
+*    - parallel batteries of like voltage when ATTiny not in sleep mode to
+*       minimize losses due to high current through internal battery resistances.
+*   
 */
 
 #include <Wire.h>           // for I2C
-#include<avr/wdt.h>         // for watchdog timer
+#include <avr/wdt.h>         // for watchdog timer
+#include <avr/sleep.h>
+#include <avr/interrupt.h>
+
 #include "ATTiny88_pins.h"  // the "" format looks for this file in the project directory
 
 /// VERSION NUMBER ///
-#define VERSION_NUMBER 0x12   // rev level of this code
+#define VERSION_NUMBER 0x13   // rev level of this code
 
-// ADCs used to read battery voltages differentially
-#define VCC_SENSE   ADC2    // ADC to read AC_IN line in CB (5V => AD2 of 0.90 V)
+// I/O to sense presence of charger
+#define AC_PRESENT   PC2    // digital read AC_IN line
 
 // Timing constants
 // By experiment, the clock is running slow by factor of 8 (8 MHz clock with scale down of 8)
 //  so define all time constants are expressed in 8 msec lsb
 //  Note that this factor does NOT apply to the watchdog timer (WDT) settings
 
+// DELAY TIMES
+//  we have a /8 clock so 125 counts/sec
 // minimum delay around the main loop... (25 => 200 msec)
-//  NOTE: don't make this too long! We have a 1 second watchdog running!
-#define LOOP_DELAY       25   
+#define LOOP_DELAY      25      // 200 msec (not too long! remember 1 second watchdog!)
+int ps_shutdown_delay = 3750;   // 30 sec (make int so there is an opportunity to change it programatically
+const int dwellTime = 1500;     // 1500 == 12 secs nominal battery charging time (sec) (each cycle)
+int ps_powerup_delay = 250;     // 2 sec
 
 // Time variables to handle next decision time
 unsigned long currentTime;
-const int dwellTime = 1500;   // 1500 == 12 secs nominal battery charging time (sec) (each cycle)
 unsigned long targetTime;
 
 // Misc global variables
-int Charger_Vcc = 0;    // AC_IN voltage measurement
 int CM4_active = 0;     // heartbeat to know if CM4 is active
 int currBat = 0;        // battery currently used to power the system
 int batCount = 0;       // number of batteries currently connected
 int battPresent[4] = {1,0,0,0};     // set to "1" if battery present
 int batVoltage[4] = {0, 0, 0, 0};   // Battery voltages sent from CM4; LSB = 16 mV
+int batGroup[4] = {0,0,0,0};        // if element is non-zero, indicates bat is part of a battery group
 int offDelay = 30;      // delay from AXP209 signal to power off (secs)
-int lastPB0 = LOW;        // set up to find falling edge of PB0
+
 unsigned long endPowerUpHoldTime;
 int poweringDown = false;
+int powerOn = false;                        // indicator that power is on (will be set/cleared as I/O PWR_CTL is written)
 
 // Constants used to select battEna and battSense FETs by reference (>= battery board 1.7.3)
 int battEna[4]   = {PA0, PA1, PA2, PA3};    // FETs to use the selected battery   
 int battSense[4] = {PD0, PD1, PD2, PD3};    // sense for battery present (HIGH)
+
+// Declarations of I/O
+#define HEARTBEAT      PC3
+#define AXP_EXTEN      PD4       // AXP209 EXTEN pin (formerly used to directly control 5V)
+#define PWR_IRQ        PD5       // signal to CM4 that power down is in process
+#define VCC_OVR         PD6       // signal controlling power to 5V converter
+
 
 /* I2C stuff */
 #define I2C_ADDRESS 0x14      // chosen address for this code
@@ -123,7 +150,10 @@ int probe = 0xee;
 int probe1 = 0xe1;
 int probe2 = 0xe2;
 int probe3 = 0xe3;
-int heartbeat = 0;
+int heart = 0;
+
+
+/* ----------------- SETUP ------------------------------ */
 
 void setup() 
 {
@@ -141,7 +171,14 @@ void setup()
   // housekeeping before enabling the WDT
   // delay (1000);  // why??
   
-  analogReference(DEFAULT);    // reference = Vcc => 1023 (0x3FF) counts
+  analogReference(DEFAULT);       // reference = Vcc => 1023 (0x3FF) counts
+  pinMode(HEARTBEAT,OUTPUT);      // create heartbeat
+  
+  // 5V control signals
+  pinMode(AXP_EXTEN,INPUT);       // monitor AXP EXTEN pin for 5V power down control
+  pinMode(VCC_OVR,INPUT);         // control signal for 5V on/off
+  pinMode(PWR_IRQ,OUTPUT);        // indicator signal for 5V going down
+  digitalWrite(PWR_IRQ,HIGH);     // initialize
 
   // set all sense lines to INPUTS 
   // A reading of HIGH indicates battery present, a LOW indicates battery missing (or backwards)
@@ -149,11 +186,6 @@ void setup()
     pinMode(battSense[n], INPUT);
   }
 
-  pinMode(PC3,OUTPUT);      // create heartbeat
-
-  pinMode(PB0, INPUT);      // monitor AXP209 EXT_ENA signal
-  pinMode(PB1, INPUT);      // override shutdown signal on falling PB0
-  pinMode(PB2, OUTPUT);
   // Set battEna control for Battery 1 (index == 0) to OUTPUT and ON
   //  (This battery is the default battery)
   pinMode(battEna[0], OUTPUT);
@@ -180,21 +212,23 @@ void setup()
 
 
 /*
+ * ------------  MAIN LOOP ----------------
  * The main loop... at intervals of dwellTime, check for battery presence on all slots, 
  * determine the next battery to be used, connect that battery, reset the time.
  */
+ 
 void loop() 
 {
   int nextBat;
 
-  heartbeat += 1;
-  heartbeat = heartbeat %2;
-  digitalWrite(PC3, heartbeat);
-
-  check_powerDown_request();
-
+  heartbeat();
+  check_sleepy();                   // if power is down and no charger, put ATTiny to sleep 
+  
   checkForBatteries();              // test for presence of all batteries at top of loop and clear batVoltage[] for missing bat
   
+  check_powerDown_request();        // test and begin power down when AXP EXTEN pin is low
+  check_powerUp_request();          // test for power up (check AXP_EXTENA for HIGH indicating power on)
+ 
   currentTime = millis();           // check if our dwell time (12 sec) is done and we need to change batteries
   if (currentTime > targetTime) {   // finished this charge/discharge cycle for current battery
     nextBat = next_bat();           // find next battery we want to use
@@ -209,36 +243,143 @@ void loop()
 }
 
 
+
+
+/* ---------------- SUBROUTINES --------------------------  */
+
 /*
- *  check_powerDown_request()
- *  This function monitors PB0 for falling edge and if found, will output PB1 HIGH
- *   for period of time equal to variable "offDelay".
+ * heartbeat()
+ *  Simple toggle of output pin to let us know the ATTiny is looping
  */
+void heartbeat(){
+  heart += 1;
+  heart = heart %2;
+  digitalWrite(HEARTBEAT, heart);
+ }
 
+/*
+ * check_powerDown_request()
+ *   Read the AXP_EXTEN line. 
+ *     HIGH: no power down request... just return
+ *     LOW:  AXP209 sensed power down (either user via pushbutton or supply voltage too low)
+ *            so begin power down timer. When timeout, take VCC_OVR low.
+ */
 void check_powerDown_request(){
-  int PB0_state;
-
-  PB0_state = digitalRead(PB0);
-  currentTime = millis();
-
-  if (poweringDown){      // in a powering down sequence
-    // check timer
-    if (currentTime >= endPowerUpHoldTime){
-      pinMode(PB1, INPUT); // release override shutdown and let RC begin 
-      poweringDown = false;      
-    }
+  if (powerOn == false){
+    return;       // we aren't powered on, so no need to check about powering off... just return    
   }
-  // Test to see if AXP209 requesting power down
-  else {
-    if ((lastPB0 == HIGH) && (PB0_state == LOW)) {
-      // AXP209 calling for shutdown
-      pinMode(PB1, OUTPUT);
-      digitalWrite(PB1,HIGH);
-      poweringDown = true; 
-      endPowerUpHoldTime = currentTime + 125*offDelay;   // 1000 / clock scaling (8) to get sec -> msec   
-    }
+  if (digitalRead(AXP_EXTEN) == HIGH){
+    return;       // AXP_EXTEN high means AXP209 is not calling for a power down... just return
   }
-  lastPB0 = PB0_state;
+  
+  // If we get here, 5V is on and AXP_EXTEN was LOW, so we need to start (or continue) power down countdown
+  if (poweringDown == false){       // just entering the power down sequence
+    poweringDown = true;
+    endPowerUpHoldTime = millis() + ps_shutdown_delay;    // 30 sec
+    digitalWrite(PWR_IRQ,LOW);      // signal CM4 we are going down
+  }
+  
+  // else we are in the countdown... check it to see if we are exhausted
+  else if (millis() >= endPowerUpHoldTime){  // exhausted             
+    digitalWrite(VCC_OVR,LOW);         // turn off the 5V supply
+    powerOn = false;
+    poweringDown = false;
+    digitalWrite(PWR_IRQ,HIGH);      // reset
+    pinMode(VCC_OVR,INPUT);          // release for AXP209 to control next power up
+  }
+}
+
+/*
+ * check_powerUp_request()
+ *   If power is off, read the AXP_EXTENA line to see if AXP209 calling for power on
+ *   If power is on, just return
+ */
+ void check_powerUp_request(){
+  if (powerOn == true){
+    return;
+  }
+  // if we get here, power was off, so see if AXP209 is turning 5V on
+  if (digitalRead(AXP_EXTEN) == LOW){
+    return;       //  no request to turn on
+  }
+  // AXP209 wants 5V
+  pinMode(VCC_OVR,OUTPUT);   // set over ride pin to OUTPUT
+  digitalWrite(VCC_OVR,HIGH);  //  and set HIGH to hold 5V on
+  powerOn = true;
+ }
+
+/*
+ * check_sleepy()
+ *  If power is down and we don't have a charger connected, put ATTiny in sleep mode
+ *  Note that we want to put all output pins into input mode to save power during sleep
+ *   (and then will need to restore them on waking up!)
+ */
+void check_sleepy(){
+  if (powerOn == true){
+    return;         // don't sleep if power is on
+  }
+  if (AC_on() == true){
+    return;         // don't sleep if AC is connected
+  }
+  
+  // if we get here, we have neither charging or discharging of batteries, so we can sleep...
+  wdt_disable();                // turn off wdt while in sleep
+  batterySelect (0);             // select battery 1 before putting selector I/O's into INPUT mode
+  // Put all outputs into input mode...
+  pinMode(VCC_OVR,INPUT);         // control signal for 5V on/off
+  pinMode(PWR_IRQ,INPUT);        // indicator signal for 5V going down
+  for (int n = 0; n<4; n++){
+    pinMode(battEna[n], INPUT);
+  }
+  pinMode(HEARTBEAT,INPUT);      // create heartbeat
+  
+  // do we need to set I2C pins to INPUT state?
+
+  // set our wakeup call to come from PC2 (AC_IN sense) or PD4 (AXP_EXTEN)
+  sei();                                  // Global enable all interrupts... same as SREG set bit 7
+  // enable interrupt on PD4 (PCINT20) ... AXP_EXTEN
+  PCICR |= (1<<PCIE2);                    // enable PCIE2 (PCINT23..16) (See ATTiny88 section 9.2 and 9.3.4)
+  PCMSK2 |= (1<<PCINT20);                 //  enable PCINT20 from within the PCIE2 group (see section 9.3.7)
+  // enable interrupt on PC2 (PCINT10) ... charger connected (AC_IN)
+  PCICR |= (1<<PCIE1);                    // enable PCIE1 (PCINT15..8) (See ATTiny88 section 9.2 and 9.3.4)
+  PCMSK1 |= (1<<PCINT10);                 //  enable PCINT10 from within the PCIE2 group (see section 9.3.8)
+
+  set_sleep_mode(SLEEP_MODE_PWR_DOWN);    // set sleep mode (register SMCR bits SM1=1, SM0=0) (see 7.4.1)
+  sleep_enable();                         // enable sleep (register SMCR bit SE=1) (see 7.4.1)
+  sleep_mode();                           // actually goes to sleep here... zzzz
+//  ZZ
+//  ZZ
+//  ZZ
+// WE ARE HERE AT WAKEUP
+//  Need to do some housekeeping (similar to setup() function since CM4 will power up (NOT come out of a sleep mode)
+  cli();          // clear interrupts ... (same as SREG set bit 7)?
+  MCUSR = 0;      // clear MCU Status Register (clears the flag indicating the wdt was the interrupt source 
+                  //   (the step you don't usually find in examples)
+  PCIFR = 0;      // clear the PC interrupt flag register
+  PCICR = 0;      // clear selection of interrupt pins
+  SMCR = 0;       // disable sleep
+  
+  wdt_reset();
+
+  // after wakeup, we need to set up outputs correctly before turning on power
+  pinMode(HEARTBEAT,OUTPUT);      // re-enable heartbeat
+  pinMode(PWR_IRQ,OUTPUT);        // indicator signal for 5V going down
+  digitalWrite(PWR_IRQ,HIGH);     // initialize HIGH (not signalling power going down)
+  // now we will enable the remaining battery FETs as OUTPUTs and HIGH (off)
+  pinMode(battEna[0], OUTPUT);
+  digitalWrite(battEna[0], LOW);  // turn on battery 1
+  for (int n = 1; n<4; n++){
+    pinMode(battEna[n], OUTPUT);
+    digitalWrite(battEna[n], HIGH);  // batteries 2-4 not enabled (initial condition)
+  }
+
+  // clear out the batVoltage[] array and let CM4 refill it
+  for (int n=0;n<4;n++){
+    batVoltage[n] = 0;
+  }
+  
+  sei();                    // enable interrupts
+  wdt_enable(WDTO_1S);      // enable WDT with a (real) timeout of 1 sec
 }
 
  
@@ -298,7 +439,7 @@ int next_bat()
     
     // see if CM4 is active (and so we have active voltage reading of the batteries)
     if (CM4_active == 1) {     //   with CM4 active, batVoltage[] readings are valid... so pick the lowest voltage (valid) battery
-      CM4_active = 0;          // reset heartbeat
+      CM4_active = 0;          // reset CM4 heartbeat
       for (n=0; n<4; n++) {
         if ((batVoltage[n] < lowest_voltage) && (batVoltage[n] > 0xC1)) {  // batt > 3100 mV to be selected
           nextBat = n;
@@ -340,11 +481,12 @@ int next_bat()
  */
 bool AC_on()       // Verified
 {  
-  Charger_Vcc = (analogRead(VCC_SENSE));  // 127 calculates to charger == 3.0 V
-  if (Charger_Vcc > 127) {
-     return (true);
+  if (digitalRead(AC_PRESENT) == HIGH){
+    return true;
   }
-  return (false);
+  else{
+    return false;
+  }
 }
 
 
@@ -358,18 +500,43 @@ bool AC_on()       // Verified
  *  the next battery. In practice, there is still a slight overlap (usec's)
  *  of the switching due to capacitive effects of FET gates.
  */
+/*
+ * FEATURE ADD:
+ *  We want to enable all batteries that are within 2 counts (32 mV) of the selected 
+ *   battery. Perhaps we can do that here? I don't think we need to be concerned with
+ *   charging/discharging (we already looked at that when we chose this battery) so
+ *   just check for battery readings within 2 counts of the selected battery??
+ *   How will the battery readings get properly saved with CM4 doing one reading of a 
+ *   group of batteries? Perhaps a new variable batGroup[] with the 4 elements representing
+ *   the currently selected group? Set that var here (when we turn them on) and then
+ *   take the group into account when we get a write to I2C register 0x21 - 0x24??
+ */
+ 
 void batterySelect (int batt)
 {
   noInterrupts();                     // turn off interrupts while we change FETs
   if (batt != currBat) {
     digitalWrite (battEna[batt], LOW);     //  turn on new battery
+    batGroup[batt] = 1;             // add new selection to batGroup[] (it may be the only one)
     digitalWrite (battEna[currBat], HIGH); //   then turn off currBat (70 usec overlap)
-
+    batGroup[currBat] = 0;             // remove previous selection from batGroup[] (it may be added again)
   }
   // else we are not changing batteries so leave status quo
+  for (int n=1; n<4; n++){
+    if (abs(batVoltage[(batt+n)%4] - batVoltage[batt]) <= 2){
+      // turn on FET and add to batGroup[] any battery within 2 counts of same voltage (32mV) 
+      batGroup[n] = 1;                  // add to group and
+      digitalWrite(battEna[n], LOW);    //  turn on FET
+    }
+    else{
+      batGroup[n] = 0;                  // remove from group and
+      digitalWrite(battEna[n], HIGH);   //  turn off FET
+    }
+  }
   interrupts();                       // turn interrupts back on
   currBat = batt;                     // the FET is turned on, so now "nextBat" becomes "currBat"
 }
+
 
 
 /* I2C communication handlers 
@@ -423,7 +590,17 @@ void DataReceive(int numBytes)
   // Handle the battery voltage write by putting the value to the appropriate batVoltage array member
     if ((rcvReg >= 0x21) && (rcvReg <= 0x24)){
       batVoltage[rcvReg - 0x21] = rcvVal;   // use value sent (lsb = 16mV)
+    //  and if part of batGroup[], fill in batVoltage[] for all members of group
+      if (batGroup[rcvReg - 0x21] == 1){  
+        for (int n=0; n<4; n++){        
+          if (batGroup[n] == 1){
+            batVoltage[n] = rcvVal;
+          }
+        }
+      }
     }
+
+    
     if (rcvReg == 0x36){      // power down delay (secs)
       offDelay = rcvVal;
     }
@@ -484,13 +661,6 @@ void DataRequest()
     case 0x24:    // single byte = (battery voltage battery 4) / 16
       sendData = batVoltage[3];
       break;  
-
-    case 0x29:                  // Charger Voltage Low 8 bits... 
-      sendData = Charger_Vcc & 0xFF;  // Ref (approx): for AC_IN == 5V, Vcc => 0x0D4
-      break;
-    case 0x2A:                  // Charger Voltage Upper 8 bits
-      sendData = Charger_Vcc >> 8;
-      break;
 
 
     case 0x30:                  // Battery Count
