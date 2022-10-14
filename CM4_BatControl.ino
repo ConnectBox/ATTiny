@@ -57,6 +57,15 @@
 *     - remove use of EEPROM  (broke i2c periodically !?)
 *     - use state of AXP_EXTEN to determine power on state on reboot of ATTiny (wdt or avrdude)
 *     
+*   Rev 0x1B by DorJamJr   
+*     - Remove "#define ENABLE_SERIAL_DEBUG" which was causing i2c reads to fail with a constant return value
+*     
+*   Rev 0x1C by DorJamJr  
+*     - Move code block in check_powerDown_request() to ensure power down completes
+*     - Reset batteries 2-4 voltage to 0 and show as "not present" at power on. This forces all battery FETs (except battery 1)
+*        to turn OFF and allows the circuit/code to correctly determine battery presence. User must NOT change batteries
+*        while power is on... possible fried circuit if low (or reversed) battery inserted in a welded position.
+*     
 *  
 */
 
@@ -166,11 +175,11 @@ void setup()
   pinMode(AXP_EXTEN,INPUT);       // monitor AXP EXTEN pin for 5V power down control
   if (digitalRead(AXP_EXTEN) == HIGH){   // AXP209 calling for power on
     digitalWrite(VCC_OVR,HIGH);   // power on
-    powerOn == true;              // set power on flag
+    powerOn = true;               // set power on flag
   }
   else{
     digitalWrite(VCC_OVR,LOW);   // power off
-    powerOn == false;            // set power on flag    
+    powerOn = false;             // set power on flag    
   }
       
   sei();          // enable interrupts
@@ -316,6 +325,17 @@ void heartbeat(){
  *            so begin power down timer. When timeout, take VCC_OVR low.
  */
 void check_powerDown_request(){
+  
+  if (poweringDown == true and millis() >= endPowerUpHoldTime){
+    digitalWrite(VCC_OVR,LOW);         // turn off the 5V supply
+    powerOn = false;
+    poweringDown = false;
+    digitalWrite(PWR_IRQ,HIGH);      // reset
+    digitalWrite(PB_IN, HIGH);      // release hold on PB_IN
+    pinMode(PB_IN, INPUT);          //  and tristate PB_IN
+    return;
+  }
+  
   if (powerOn == false){
     return;       // we aren't powered on, so no need to check about powering off... just return    
   }
@@ -333,15 +353,14 @@ void check_powerDown_request(){
   }
   
   // else we are in the countdown... check it to see if we are exhausted
-  else if (millis() >= endPowerUpHoldTime){  // exhausted 
-//    EEPROM.write(EEpowerFlag, 0);   // save state of power in EEPROM
-    digitalWrite(VCC_OVR,LOW);         // turn off the 5V supply
-    powerOn = false;
-    poweringDown = false;
-    digitalWrite(PWR_IRQ,HIGH);      // reset
-    digitalWrite(PB_IN, HIGH);      // release hold on PB_IN
-    pinMode(PB_IN, INPUT);          //  and tristate PB_IN
-  }
+//  else if (millis() >= endPowerUpHoldTime){  // exhausted 
+//    digitalWrite(VCC_OVR,LOW);         // turn off the 5V supply
+//    powerOn = false;
+//    poweringDown = false;
+//    digitalWrite(PWR_IRQ,HIGH);      // reset
+//    digitalWrite(PB_IN, HIGH);      // release hold on PB_IN
+//    pinMode(PB_IN, INPUT);          //  and tristate PB_IN
+//  }
 }
 
 /*
@@ -372,10 +391,20 @@ void check_powerDown_request(){
     }
     else{                                   // we are in a power up request... see if we have reached our target time
       if (currentTime > powerup_targetTime){
-//        EEPROM.write(EEpowerFlag, 1);   // save state of power in EEPROM
         digitalWrite(VCC_OVR,HIGH);  //  and set HIGH to hold 5V on
         powerOn = true;      
         powerRequestInProgress = false;
+        // We do the following to allow battery present circuit to detect batteries which have been removed
+        //  This will remove all batteries from the weld... ("welded" batteries cannot be detected as missing!)
+        //  User MUST NOT remove and reinsert batteries when the unit is running... could fry stuff!!
+        for (int n=0; n<4; n++){
+          battPresent[n] = false;
+          batVoltageATT[n] = 0;    // clear all the voltages and battery present arrays
+        }
+        digitalWrite (battEna[0], LOW);      //  turn on  battery 1
+        digitalWrite (battEna[1], HIGH);     //  turn off battery 2
+        digitalWrite (battEna[2], HIGH);     //  turn off battery 3
+        digitalWrite (battEna[3], HIGH);     //  turn off battery 4
       }
     }  
   }
@@ -528,38 +557,6 @@ int next_bat()
     CM4_active = 0;
   }
   
-/*  DEEPRECATED
- *     // if CM4 isn't active, just choose the next available battery... and modify dwellAdjust based on relative batVoltageATT[] 
- *   
- else {
-    for (n=0; n<4; n++){
-      m = (n + 1 + currBat) % 4;    // choose next battery after current battery
-      if (battPresent[m]){          
-        nextBat = m;
-        
-        // now calculate dwellAdjust based on relative batt voltage
-        //  Algorithm... dwellAdjust = (Vavg - Vx)(limit +/- 80) + 100 ... note lsb = 5mV 
-        for (n=0; n<4; n++){
-          if (batVoltageATT[n] > 500){    // 2.5 V minimum for valid bat to remove ADC noise reading
-            avgVBatt += batVoltageATT[n];
-            validBatts +=1;
-          }
-        }
-        if (validBatts > 0){
-          avgVBatt = avgVBatt / validBatts;   // average bat voltage of the installed batteries
-          dwellAdjust = constrain((avgVBatt - batVoltageATT[nextBat]) * 3,-80,200);
-          dwellAdjust = dwellTime * dwellAdjust / 100;
-        }
-        
-        return nextBat;                              
-      } 
-    }      
-  }
-  *  REMOVED since we will use ATTiny read bat voltage
-
-  // If we got here then the CM4 is active and we can read battery voltages
- */ 
-
  
   // Initial battery reading... pick next battery which is present but has no voltage reading...
   //  Note: we want JUST THIS battery to be selected since we will figure out its voltage during this cycle
@@ -578,25 +575,7 @@ int next_bat()
   
 
   // check to see if we are charging
-  if (AC_on()) {               // charging... so pick the lowest battery 
-
-/* DEORECATED  
-    
-    // check if we have just entered AC charging... if so, read all batteries
-    if (AC_on_count < 5){
-      for (n=AC_on_count -1;n<4; n++){
-        if (battPresent[n]){      // if battery of AC_on_count (1 based) is present, select it, else pick next available after that
-          nextBat = n;
-          found_battery = true;
-          break;
-        }
-      }
-      if (found_battery == true){
-        return nextBat;     // only if we found a battery at or above the AC_on_count position
-      }
-    }
-*/ 
-    
+  if (AC_on()) {               // charging... so pick the lowest battery     
     for (n=0; n<4; n++) {
       if ((batVoltageATT[n] < lowest_voltage) && (batVoltageATT[n] > 580)) {  // lsb = 5mv => batt > 2900 mV to be selected
         nextBat = n;
@@ -606,24 +585,6 @@ int next_bat()
   }
 
   else {                      // discharging, so pick the highest voltage battery
-
-/* DEPRECATED     
-    // check if we have just left AC charging... if so, read all batteries
-    if (AC_off_count < 5){
-      for (n=AC_off_count -1;n<4; n++){
-        if (battPresent[n]){      // if battery of AC_on_count (1 based) is present, select it, else pick next available after that
-          nextBat = n;
-          found_battery = true;
-          break;
-        }
-      }
-      if (found_battery == true){
-        return nextBat;     // only if we found a battery at or above the AC_on_count position
-      }
-    }
-
-*/    
-    
     for (n=0; n<4; n++){
       if (batVoltageATT[n] > highest_voltage) {
         nextBat = n;
@@ -687,7 +648,6 @@ void batterySelect (int batt)
       groupBitmap += 1;
     }
   }
-
   
   noInterrupts();                     // turn off interrupts while we change FETs
   // turn on FETs for batteries with "1" in the batGroup[]
@@ -698,7 +658,7 @@ void batterySelect (int batt)
   }
   for (n=0; n<4; n++){
     if (batGroup[n] == 0){
-      digitalWrite (battEna[n], HIGH);     //  turn off battery in the batGroup[]
+      digitalWrite (battEna[n], HIGH);     //  turn off battery not in the batGroup[]
     }
   }
   interrupts();                       // turn interrupts back on
