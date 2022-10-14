@@ -42,6 +42,10 @@
 *     - Add I2C reading of the batVoltageATT[] array using registers 0x41 - 0x44 (lsb = 20mV)
 *        Note that these readings are ONLY USED during the powered down and charging state of the machine, but they
 *        are read whenever the ATTiny is powered.
+*        
+*   Rev 0x18 by DorJamJr     
+*     - Change clock speed and all timing constants to 8 MHz to fix occassional i2c communication issues
+*     
 *  
 */
 
@@ -54,7 +58,7 @@
 #include "ATTiny88_pins.h"  // the "" format looks for this file in the project directory
 
 /// VERSION NUMBER ///
-#define VERSION_NUMBER 0x17   // rev level of this code
+#define VERSION_NUMBER 0x18   // rev level of this code
 
 
 // Timing constants
@@ -62,13 +66,11 @@
 //  so define all time constants are expressed in 8 msec lsb
 //  Note that this factor does NOT apply to the watchdog timer (WDT) settings
 
-// DELAY TIMES
-//  REMOVED!!: we have a /8 clock so 125 counts/sec
-// minimum delay around the main loop... (200 => 200 msec)
+// DELAY TIMES ... the following based on 8 MHz clock (no pre-scaling)
 #define LOOP_DELAY      200      // 200 msec (not too long! remember 1 second watchdog!)
 int ps_shutdown_delay = 20000;   // 20 sec (make int so there is an opportunity to change it programatically
-const int dwellTime = 12000;     // 12 secs nominal battery charging time (sec) (each cycle)
-int dwellAdjust  = 0;           // adjustment of dwell time to run durning unpowered charging... based on batVoltageATT[] value
+const int dwellTime   = 12000;   // 12 secs nominal battery charging time (sec) (each cycle)
+int dwellAdjust  = 0;            // adjustment of dwell time to run durning unpowered charging... based on batVoltageATT[] value
 int ps_powerup_delay = 2000;     // 2 sec
 
 // Time variables to handle next decision time
@@ -145,14 +147,10 @@ void setup()
   
   // clock prescaler - 0000 = 8 MHZ, 0001 = 4 MHZ, 0010 = 2 MHZ, 0011 = 1 MHZ
   CLKPR = 0x80;     // enable prescaler write
-  CLKPR = 0x00;   // set to 8 MHZ 
-  // NOTE: THE ABOVE AFFECTS ALL TIMINGS!!
-   
+  CLKPR = 0x00;     // set to 8 MHZ    
   sei();          // enable interrupts
 
-  // housekeeping before enabling the WDT
-  // delay (1000);  // why??
-  
+  // housekeeping before enabling the WDT  
   analogReference(INTERNAL);       // reference = 1.1V => 1023 (0x3FF) counts
   pinMode(HEARTBEAT,OUTPUT);      // create heartbeat
   pinMode(FASTBEAT,OUTPUT);
@@ -201,8 +199,7 @@ void setup()
   // SoftwareSerial setup
   pinMode(rxPin, INPUT);
   pinMode(txPin, OUTPUT);
-//    mySerial.begin(76800);  // baud of 9600 (note; this is for 1MHz clock)
-    mySerial.begin(9600);  // baud of 9600 
+  mySerial.begin(9600);  // baud of 9600 
 #endif
 }
 
