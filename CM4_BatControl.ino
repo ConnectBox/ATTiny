@@ -66,7 +66,11 @@
 *        to turn OFF and allows the circuit/code to correctly determine battery presence. User must NOT change batteries
 *        while power is on... possible fried circuit if low (or reversed) battery inserted in a welded position.
 *     
-*  
+*   Rev 0x1D by DorJamJr  
+*     - change reset of batteries 2-4 to when power off occurs. This leaves logic in place to detect battery polarity
+*        during power off, when the user might be changing batteries
+*     - Add function force_batteryCycle() to reset battery arrays and force cycle through of all batteries. This can  
+*        be triggered by a read of register 0x40 and allcow the CM4 to cycle through all batteries to learn voltages
 */
 
 #include <Wire.h>           // for I2C
@@ -78,7 +82,7 @@
 #include "ATTiny88_pins.h"  // the "" format looks for this file in the project directory
 
 /// VERSION NUMBER ///
-#define VERSION_NUMBER 0x1B   // rev level of this code
+#define VERSION_NUMBER 0x1D   // rev level of this code
 
 
 // Timing constants
@@ -99,7 +103,6 @@ unsigned long targetTime;
 unsigned long powerup_targetTime;
 
 // Misc global variables
-int CM4_active = 0;     // heartbeat to know if CM4 is active
 int currBat = 0;        // battery currently used to power the system
 int batCount = 0;       // number of batteries currently connected
 int battPresent[4] = {1,0,0,0};     // set to "1" if battery present
@@ -330,9 +333,13 @@ void check_powerDown_request(){
     digitalWrite(VCC_OVR,LOW);         // turn off the 5V supply
     powerOn = false;
     poweringDown = false;
-    digitalWrite(PWR_IRQ,HIGH);      // reset
+    digitalWrite(PWR_IRQ,HIGH);     // reset
     digitalWrite(PB_IN, HIGH);      // release hold on PB_IN
     pinMode(PB_IN, INPUT);          //  and tristate PB_IN
+    // We do the following to allow battery present circuit to detect batteries which have been removed
+    //  This will remove all batteries from the weld... ("welded" batteries cannot be detected as missing!)
+    //  User MUST NOT remove and reinsert batteries when the unit is running... could fry stuff!!
+    force_batteryCycle();
     return;
   }
   
@@ -351,17 +358,18 @@ void check_powerDown_request(){
     digitalWrite(PB_IN, LOW);     // hold PB signal low to prevent false retrigger of power up while powering down
     digitalWrite(PWR_IRQ,LOW);      // signal CM4 we are going down
   }
-  
-  // else we are in the countdown... check it to see if we are exhausted
-//  else if (millis() >= endPowerUpHoldTime){  // exhausted 
-//    digitalWrite(VCC_OVR,LOW);         // turn off the 5V supply
-//    powerOn = false;
-//    poweringDown = false;
-//    digitalWrite(PWR_IRQ,HIGH);      // reset
-//    digitalWrite(PB_IN, HIGH);      // release hold on PB_IN
-//    pinMode(PB_IN, INPUT);          //  and tristate PB_IN
-//  }
 }
+
+void force_batteryCycle(){
+    for (int n=0; n<4; n++){
+      battPresent[n] = false;
+      batVoltageATT[n] = 0;    // clear all the voltages and battery present arrays
+    }
+    digitalWrite (battEna[0], LOW);      //  turn on  battery 1
+    digitalWrite (battEna[1], HIGH);     //  turn off battery 2
+    digitalWrite (battEna[2], HIGH);     //  turn off battery 3
+    digitalWrite (battEna[3], HIGH);     //  turn off battery 4
+ }
 
 /*
  * check_powerUp_request()
@@ -394,21 +402,203 @@ void check_powerDown_request(){
         digitalWrite(VCC_OVR,HIGH);  //  and set HIGH to hold 5V on
         powerOn = true;      
         powerRequestInProgress = false;
-        // We do the following to allow battery present circuit to detect batteries which have been removed
-        //  This will remove all batteries from the weld... ("welded" batteries cannot be detected as missing!)
-        //  User MUST NOT remove and reinsert batteries when the unit is running... could fry stuff!!
-        for (int n=0; n<4; n++){
-          battPresent[n] = false;
-          batVoltageATT[n] = 0;    // clear all the voltages and battery present arrays
-        }
-        digitalWrite (battEna[0], LOW);      //  turn on  battery 1
-        digitalWrite (battEna[1], HIGH);     //  turn off battery 2
-        digitalWrite (battEna[2], HIGH);     //  turn off battery 3
-        digitalWrite (battEna[3], HIGH);     //  turn off battery 4
       }
     }  
   }
 } 
+
+
+ 
+/*
+ * checkForBatteries()
+ * This function will check all battery positions for presence of battery
+ * If a battery is missing, the associated voltage reading in batVoltageATT[] array 
+ *  will be set to zero
+ */
+void checkForBatteries(){
+  int n;
+  int last_battBitmap;
+  int changedBatt;
+
+  batCount = 0;     // initialize
+  for (n=0; n<4; n++){
+    if (digitalRead(battSense[n]) == HIGH){
+      battPresent[n] = true;
+      batCount ++;
+    }
+    else{         // battery missing, clear presence and voltage array for that bat
+      battPresent[n] = false;
+      batVoltageATT[n] = 0;    // clear the voltage for a battery not present
+    }
+  }
+
+  // Note: an added battery just sensed will still have a previous voltage of 0 in the voltage array
+  
+  // battBitmap is bitmap of batteries present... formerly calculated at i2c register 0x32
+  last_battBitmap = battBitmap;   // we will check for a change
+  battBitmap = 0;
+  for (n=0; n<4; n++){
+    battBitmap *= 2;    // batCoded shift left
+    if (battPresent[3-n] == true){
+      battBitmap += 1;
+    }
+  }
+}  // end of checkForBatteries()
+
+
+/*
+ * next_bat()
+ *   Determine the next battery to select based on the following logic:
+ *   - IF: any battPresent[] == true with batVoltageATT[] == 0, select that battery -> LOOP
+ *   - ELSE:
+ *    - IF charging:
+ *       - Choose battery with lowest voltage -> LOOP
+ *   - IF not charging:    
+ *       - Choose battery with highest voltage -> LOOP
+ *     
+ *  Note: This routine returns a single battery number BUT will return battery number +4 if eligible for multiBattery selection  
+ */
+int next_bat() 
+{
+  int n, m;
+  int nextBat;
+  int highest_voltage = 0;
+  int lowest_voltage = 900;   // lsb = 5mV => 4.5V 
+  bool found_battery = false;
+  long avgVBatt = 0;
+  int validBatts = 0;
+
+  dwellAdjust = 0;    // default unless we are unpowered and charging
+   
+  // Initial battery reading... pick next battery which is present but has no voltage reading...
+  //  Note: we want JUST THIS battery to be selected since we will figure out its voltage during this cycle
+  //   and don't want the reading corrupted by parallel batteries... so return the real battery number (not +4)
+  for (n=0; n<4; n++){
+    m = (n + 1 + currBat) % 4;    // start with battery AFTER current battery and look through all 4 battery positions
+    if (battPresent[m] && (batVoltageATT[m] == 0)){    // special case... battery present but not yet read by ATTiny
+        nextBat = m;                                //  so FORCE this battery
+        return nextBat;     // only case where we will force single (non parallel) battery combination
+    } 
+  } 
+    
+  // all batteries have had their voltages read... proceed with normal selection
+  //  which will choose the lowest number battery meeting the criteria (so if equal readings,
+  //  meeting the voltage criteria (lowest/highest voltage) the lowest number battery is selected) 
+
+  // check to see if we are charging
+  if (AC_on()) {               // charging... so pick the lowest battery     
+    for (n=0; n<4; n++) {
+      if ((batVoltageATT[n] < lowest_voltage) && (batVoltageATT[n] > 580)) {  // lsb = 5mv => batt > 2900 mV to be selected
+        nextBat = n;
+        lowest_voltage = batVoltageATT[n];
+      }
+    }
+  }
+
+  else {                      // discharging, so pick the highest voltage battery
+    for (n=0; n<4; n++){
+      if (batVoltageATT[n] > highest_voltage) {
+        nextBat = n;
+        highest_voltage = batVoltageATT[n];
+      }
+    }
+  }
+
+  if (powerOn == true){
+   // if we got here, the selection can be multiple batteries, so return nextBat +4 to signal that to batterySelect()     
+     return nextBat + 4;  
+   }
+   else{
+     return nextBat;   // don't allow welding if power isn't on... (the time when users can change batteries)
+   }
+}
+
+
+
+
+/*
+ * batterySelect (int batt)
+ * Turn on FET for select battery position (passing in the nextBat reference)
+ * Interrupts are suspended just before the switch over and enabled just after to 
+ *  insure that we aren't servicing an interrupt while both FETs are on
+ *  
+ * Note that the determination of batteries to be on (grouping) is done before any 
+ *  actual switching of batteries. Once the set of on batteries is determined, interrupts
+ *  are suspended, the "ON" batteries are turned on, then the "OFF" batteries are turned
+ *  off and finally, interrupts are enabled. 
+ */
+ 
+void batterySelect (int batt)
+{
+  int n;
+  bool grouping_ok;
+
+  if (batt >= 4){
+    grouping_ok = true;
+    batt -= 4;    // restore actual battery number
+  }
+  else{
+    grouping_ok = false;
+  }
+
+  // clear the group
+  for (n=0;n<4;n++){
+    batGroup[n] = 0;
+  }
+  batGroup[batt] = 1;             // add new selection to batGroup[] (it may be the only one)
+  
+  if (grouping_ok == true){      // the multiple battery function... 
+  // add to batGroup[] any battery within 6 lsb of the same voltage (lsb = 5mV) 
+    for (n=1; n<4; n++){
+      if (abs (batVoltageATT[(batt+n)%4] - batVoltageATT[batt])<=6){    // within 30 mV
+        batGroup[(batt+n)%4] = 1;                  // add to group and     // 0x33
+      }
+    }
+  }
+
+  // build up the bitmap
+  groupBitmap = 0;
+  for (n=0; n<4; n++){
+    groupBitmap *= 2;    // batCoded shift left
+    if (batGroup[3-n] == true){
+      groupBitmap += 1;
+    }
+  }
+  
+  noInterrupts();                     // turn off interrupts while we change FETs
+  // turn on FETs for batteries with "1" in the batGroup[]
+  for (n=0; n<4; n++){
+    if (batGroup[n] == 1){
+      digitalWrite (battEna[n], LOW);     //  turn on battery in the batGroup[]
+    }
+  }
+  for (n=0; n<4; n++){
+    if (batGroup[n] == 0){
+      digitalWrite (battEna[n], HIGH);     //  turn off battery not in the batGroup[]
+    }
+  }
+  interrupts();                       // turn interrupts back on
+  currBat = batt;                     // the FET is turned on, so now "nextBat" becomes "currBat"
+}
+
+
+
+/*
+ * AC_on()
+ * Determine if AC_IN line is powered (ie, is charger connected) and return TRUE/FALSE
+ */
+bool AC_on()       // Verified
+{  
+  if (digitalRead(AC_PRESENT) == HIGH){
+    return true;
+  }
+  else{
+    return false;
+  }
+}
+
+
+
 
 /*
  * check_sleepy()
@@ -486,197 +676,6 @@ void check_sleepy(){
   
   sei();                    // enable interrupts
   wdt_enable(WDTO_1S);      // enable WDT with a (real) timeout of 1 sec
-}
-
- 
-/*
- * checkForBatteries()
- * This function will check all battery positions for presence of battery
- * If a battery is missing, the associated voltage reading in batVoltageATT[] array 
- *  will be set to zero
- */
-void checkForBatteries(){
-  int n;
-  int last_battBitmap;
-  int changedBatt;
-
-  batCount = 0;     // initialize
-  for (n=0; n<4; n++){
-    if (digitalRead(battSense[n]) == HIGH){
-      battPresent[n] = true;
-      batCount ++;
-    }
-    else{         // battery missing, clear presence and voltage array for that bat
-      battPresent[n] = false;
-      batVoltageATT[n] = 0;    // clear the voltage for a battery not present
-    }
-  }
-
-  // Note: an added battery just sensed will still have a previous voltage of 0 in the voltage array
-  
-  // battBitmap is bitmap of batteries present... formerly calculated at i2c register 0x32
-  last_battBitmap = battBitmap;   // we will check for a change
-  battBitmap = 0;
-  for (n=0; n<4; n++){
-    battBitmap *= 2;    // batCoded shift left
-    if (battPresent[3-n] == true){
-      battBitmap += 1;
-    }
-  }
-}  // end of checkForBatteries()
-
-
-/*
- * next_bat()
- *   Determine the next battery to select based on the following logic:
- *   - IF: any battPresent[] == true with batVoltageATT[] == 0, select that battery -> LOOP
- *   - ELSE:
- *    - IF charging:
- *       - Choose battery with lowest voltage -> LOOP
- *   - IF not charging:    
- *       - Choose battery with highest voltage -> LOOP
- *     
- *  Note: This routine returns a single battery number BUT will return battery number +4 if eligible for multiBattery selection  
- */
-int next_bat() 
-{
-  int n, m;
-  int nextBat;
-  int highest_voltage = 0;
-  int lowest_voltage = 900;   // lsb = 5mV => 4.5V 
-  bool found_battery = false;
-  long avgVBatt = 0;
-  int validBatts = 0;
-
-  dwellAdjust = 0;    // default unless we are unpowered and charging
-
-// ver 0x19 - don't need cm4_active... read voltages via ATTiny
-
-  // first handle reset of CM4_active flag 
-  if (CM4_active == 1) {
-    CM4_active = 0;
-  }
-  
- 
-  // Initial battery reading... pick next battery which is present but has no voltage reading...
-  //  Note: we want JUST THIS battery to be selected since we will figure out its voltage during this cycle
-  //   and don't want the reading corrupted by parallel batteries... so return the real battery number (not +4)
-  for (n=0; n<4; n++){
-    m = (n + 1 + currBat) % 4;    // start with battery AFTER current battery and look through all 4 battery positions
-    if (battPresent[m] && (batVoltageATT[m] == 0)){    // special case... battery present but not yet read by ATTiny
-        nextBat = m;                                //  so FORCE this battery
-        return nextBat;     // only case where we will force single (non parallel) battery combination
-    } 
-  } 
-    
-  // all batteries have had their voltages read... proceed with normal selection
-  //  which will choose the lowest number battery meeting the criteria (so if equal readings,
-  //  meeting the voltage criteria (lowest/highest voltage) the lowest number battery is selected)
-  
-
-  // check to see if we are charging
-  if (AC_on()) {               // charging... so pick the lowest battery     
-    for (n=0; n<4; n++) {
-      if ((batVoltageATT[n] < lowest_voltage) && (batVoltageATT[n] > 580)) {  // lsb = 5mv => batt > 2900 mV to be selected
-        nextBat = n;
-        lowest_voltage = batVoltageATT[n];
-      }
-    }
-  }
-
-  else {                      // discharging, so pick the highest voltage battery
-    for (n=0; n<4; n++){
-      if (batVoltageATT[n] > highest_voltage) {
-        nextBat = n;
-        highest_voltage = batVoltageATT[n];
-      }
-    }
-  }
- // if we got here, the selection can be multiple batteries, so return nextBat +4 to signal that to batterySelect()     
- return nextBat + 4;  
-}
-
-
-
-
-/*
- * batterySelect (int batt)
- * Turn on FET for select battery position (passing in the nextBat reference)
- * Interrupts are suspended just before the switch over and enabled just after to 
- *  insure that we aren't servicing an interrupt while both FETs are on
- *  
- * Note that the determination of batteries to be on (grouping) is done before any 
- *  actual switching of batteries. Once the set of on batteries is determined, interrupts
- *  are suspended, the "ON" batteries are turned on, then the "OFF" batteries are turned
- *  off and finally, interrupts are enabled.
- *  
- *  
- */
- 
-void batterySelect (int batt)
-{
-  int n;
-  bool grouping_ok;
-
-  if (batt >= 4){
-    grouping_ok = true;
-    batt -= 4;    // restore actual battery number
-  }
-  else{
-    grouping_ok = false;
-  }
-
-  // clear the group
-  for (n=0;n<4;n++){
-    batGroup[n] = 0;
-  }
-  batGroup[batt] = 1;             // add new selection to batGroup[] (it may be the only one)
-  
-  if (grouping_ok == true){      // the multiple battery function... 
-  // add to batGroup[] any battery within 6 lsb of the same voltage (lsb = 5mV) 
-    for (n=1; n<4; n++){
-      if (abs (batVoltageATT[(batt+n)%4] - batVoltageATT[batt])<=6){    // within 30 mV
-        batGroup[(batt+n)%4] = 1;                  // add to group and     // 0x33
-      }
-    }
-  }
-
-  groupBitmap = 0;
-  for (n=0; n<4; n++){
-    groupBitmap *= 2;    // batCoded shift left
-    if (batGroup[3-n] == true){
-      groupBitmap += 1;
-    }
-  }
-  
-  noInterrupts();                     // turn off interrupts while we change FETs
-  // turn on FETs for batteries with "1" in the batGroup[]
-  for (n=0; n<4; n++){
-    if (batGroup[n] == 1){
-      digitalWrite (battEna[n], LOW);     //  turn on battery in the batGroup[]
-    }
-  }
-  for (n=0; n<4; n++){
-    if (batGroup[n] == 0){
-      digitalWrite (battEna[n], HIGH);     //  turn off battery not in the batGroup[]
-    }
-  }
-  interrupts();                       // turn interrupts back on
-  currBat = batt;                     // the FET is turned on, so now "nextBat" becomes "currBat"
-}
-
-/*
- * AC_on()
- * Determine if AC_IN line is powered (ie, is charger connected) and return TRUE/FALSE
- */
-bool AC_on()       // Verified
-{  
-  if (digitalRead(AC_PRESENT) == HIGH){
-    return true;
-  }
-  else{
-    return false;
-  }
 }
 
 
@@ -782,7 +781,6 @@ void DataRequest()
         
     case 0x31:                  // Current Battery
       sendData = currBat + 1;   // (battery number is zero based)
-      CM4_active = 1;           // heartbeat... set to 1 each time CM4 does a read
       break;
 
     case 0x32:    // sendData = binary representation of battPresent array; bit 0 == battPresent[0], etc
@@ -791,6 +789,7 @@ void DataRequest()
     case 0x33:    // sendData = binary representation of batGroup array; bit 0 == batt1 in array, etc
       sendData = groupBitmap;
       break;
+
 
     case 0x37:        // report time remaining in power up hold
       if (poweringDown){
@@ -801,8 +800,9 @@ void DataRequest()
       }
       break;   
 
-    case 0x40:                  // heartbeat
-      sendData = CM4_active;
+    case 0x40:                  // Request from CM4 to reset battery arrays so all bat voltages can
+      force_batteryCycle();           // Forces batteries to cycle so CM4 can read voltages
+      sendData = 1;    
       break;
 
     case 0x41:    // Bat 1 voltage as read by ATTiny ADC0, lsb = 5mV 
