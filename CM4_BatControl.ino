@@ -71,6 +71,14 @@
 *        during power off, when the user might be changing batteries
 *     - Add function force_batteryCycle() to reset battery arrays and force cycle through of all batteries. This can  
 *        be triggered by a read of register 0x40 and allcow the CM4 to cycle through all batteries to learn voltages
+*        
+*   Rev 0x1E by DorJamJr     
+*     - fixed missing "break;" after case 0x32
+*     - changed return value of case 0x40 (reset battery arrays) to equal loop_increment so CM4 will know if we have
+*        i2c communication hang
+*      - Add case 0x34 (returns AC_on() result)
+*      - Change variable lowest_voltage start value to 1000 (was 900) (lsb now 4.6 mv, not 5 mv)
+*      
 */
 
 #include <Wire.h>           // for I2C
@@ -82,7 +90,7 @@
 #include "ATTiny88_pins.h"  // the "" format looks for this file in the project directory
 
 /// VERSION NUMBER ///
-#define VERSION_NUMBER 0x1D   // rev level of this code
+#define VERSION_NUMBER 0x1E   // rev level of this code
 
 
 // Timing constants
@@ -152,12 +160,14 @@ int multi[4] = {0,0,0,0};     // used in handling multi byte i2c communication
 #define CMD_ERROR 0xE8        // constant used in debugging code
 int testIncrement = 0;
 int loopIncrement = 0;
-int probe = 0xee;
-int probe1 = 0xe1;
-int probe2 = 0xe2;
-int probe3 = 0xe3;
+int probe = 0xAE;
+int probe1 = 0xA1;
+int probe2 = 0xA2;
+int probe3 = 0xA3;
+int probe4 = 0xA4;
 int heart = 0;
 int heart_rate = 1;
+
 
 
 /* ----------------- SETUP ------------------------------ */
@@ -236,6 +246,7 @@ void setup()
   mySerial.begin(9600);  // baud of 9600 
 #endif
 }
+
 
 
 /*
@@ -320,6 +331,47 @@ void heartbeat(){
   }
  }
 
+
+
+/*
+ * checkForBatteries()
+ * This function will check all battery positions for presence of battery
+ * If a battery is missing, the associated voltage reading in batVoltageATT[] array 
+ *  will be set to zero
+ */
+void checkForBatteries(){
+  int n;
+  int changedBatt;
+  int x;
+
+  batCount = 0;     // initialize
+  for (n=0; n<4; n++){
+    if (digitalRead(battSense[n]) == HIGH){
+      battPresent[n] = true;
+      batCount ++;
+    }
+    else{         // battery missing, clear presence and voltage array for that bat
+      battPresent[n] = false;
+      batVoltageATT[n] = 0;    // clear the voltage for a battery not present
+    }
+  }
+
+  // Note: an added battery just sensed will still have a previous voltage of 0 in the voltage array
+  
+  // battBitmap is bitmap of batteries present... formerly calculated at i2c register 0x32
+  battBitmap = 0;
+  x=0;
+  for (n=0; n<4; n++){
+    battBitmap *= 2;    // batCoded shift left
+    if (battPresent[3-n] == true){
+      battBitmap += 1;
+      x++;
+    }
+  }
+}  // end of checkForBatteries()
+
+
+
 /*
  * check_powerDown_request()
  *   Read the AXP_EXTEN line. 
@@ -360,16 +412,7 @@ void check_powerDown_request(){
   }
 }
 
-void force_batteryCycle(){
-    for (int n=0; n<4; n++){
-      battPresent[n] = false;
-      batVoltageATT[n] = 0;    // clear all the voltages and battery present arrays
-    }
-    digitalWrite (battEna[0], LOW);      //  turn on  battery 1
-    digitalWrite (battEna[1], HIGH);     //  turn off battery 2
-    digitalWrite (battEna[2], HIGH);     //  turn off battery 3
-    digitalWrite (battEna[3], HIGH);     //  turn off battery 4
- }
+
 
 /*
  * check_powerUp_request()
@@ -408,43 +451,6 @@ void force_batteryCycle(){
 } 
 
 
- 
-/*
- * checkForBatteries()
- * This function will check all battery positions for presence of battery
- * If a battery is missing, the associated voltage reading in batVoltageATT[] array 
- *  will be set to zero
- */
-void checkForBatteries(){
-  int n;
-  int last_battBitmap;
-  int changedBatt;
-
-  batCount = 0;     // initialize
-  for (n=0; n<4; n++){
-    if (digitalRead(battSense[n]) == HIGH){
-      battPresent[n] = true;
-      batCount ++;
-    }
-    else{         // battery missing, clear presence and voltage array for that bat
-      battPresent[n] = false;
-      batVoltageATT[n] = 0;    // clear the voltage for a battery not present
-    }
-  }
-
-  // Note: an added battery just sensed will still have a previous voltage of 0 in the voltage array
-  
-  // battBitmap is bitmap of batteries present... formerly calculated at i2c register 0x32
-  last_battBitmap = battBitmap;   // we will check for a change
-  battBitmap = 0;
-  for (n=0; n<4; n++){
-    battBitmap *= 2;    // batCoded shift left
-    if (battPresent[3-n] == true){
-      battBitmap += 1;
-    }
-  }
-}  // end of checkForBatteries()
-
 
 /*
  * next_bat()
@@ -463,7 +469,7 @@ int next_bat()
   int n, m;
   int nextBat;
   int highest_voltage = 0;
-  int lowest_voltage = 900;   // lsb = 5mV => 4.5V 
+  int lowest_voltage = 1000;   // lsb = 4.6mV => 4.6V 
   bool found_battery = false;
   long avgVBatt = 0;
   int validBatts = 0;
@@ -486,7 +492,7 @@ int next_bat()
   //  meeting the voltage criteria (lowest/highest voltage) the lowest number battery is selected) 
 
   // check to see if we are charging
-  if (AC_on()) {               // charging... so pick the lowest battery     
+  if (AC_on()) {     // charging... so pick the lowest battery
     for (n=0; n<4; n++) {
       if ((batVoltageATT[n] < lowest_voltage) && (batVoltageATT[n] > 580)) {  // lsb = 5mv => batt > 2900 mV to be selected
         nextBat = n;
@@ -512,7 +518,6 @@ int next_bat()
      return nextBat;   // don't allow welding if power isn't on... (the time when users can change batteries)
    }
 }
-
 
 
 
@@ -599,12 +604,32 @@ bool AC_on()       // Verified
 
 
 
+/*
+ * force_batteryCycle()
+ *   Clears the battery registers to force selection and read of all batteries present.
+ *   This is called at power down to allow user to safely change batteries. Also called
+ *   in response to a read of register 0x40 (allowing the CM4 to trigger this function).
+ */
+void force_batteryCycle(){
+    for (int n=0; n<4; n++){
+      battPresent[n] = false;
+      batVoltageATT[n] = 0;    // clear all the voltages and battery present arrays
+    }
+    digitalWrite (battEna[0], LOW);      //  turn on  battery 1
+    digitalWrite (battEna[1], HIGH);     //  turn off battery 2
+    digitalWrite (battEna[2], HIGH);     //  turn off battery 3
+    digitalWrite (battEna[3], HIGH);     //  turn off battery 4
+ }
+
+
 
 /*
  * check_sleepy()
  *  If power is down and we don't have a charger connected, put ATTiny in sleep mode
  *  Note that we want to put all output pins into input mode to save power during sleep
  *   (and then will need to restore them on waking up!)
+ *  ALSO NOTE: This function is not currently used but is left in place in case we want 
+ *   to try to make it work in the future.
  */
 void check_sleepy(){
   if (powerOn == true){
@@ -679,6 +704,8 @@ void check_sleepy(){
 }
 
 
+
+
 /* I2C communication handlers 
 * 
 * For the slave, data transfer is handled by interrupt servicing. We just need two 
@@ -742,6 +769,8 @@ void DataReceive(int numBytes)
   }       // else... we have a normal request from the CM4
 }
 
+
+
 /*
  * The DataRequest() function sends data back to the master, usually in response to
  *  a request for data from the master. So here we will interpret the rcvData, formulate
@@ -785,10 +814,15 @@ void DataRequest()
 
     case 0x32:    // sendData = binary representation of battPresent array; bit 0 == battPresent[0], etc
       sendData = battBitmap;
+      break;
       
     case 0x33:    // sendData = binary representation of batGroup array; bit 0 == batt1 in array, etc
       sendData = groupBitmap;
       break;
+      
+    case 0x34:
+       sendData = AC_on();
+       break;  
 
 
     case 0x37:        // report time remaining in power up hold
@@ -802,7 +836,7 @@ void DataRequest()
 
     case 0x40:                  // Request from CM4 to reset battery arrays so all bat voltages can
       force_batteryCycle();           // Forces batteries to cycle so CM4 can read voltages
-      sendData = 1;    
+      sendData = loopIncrement;       // increments every 200 msec
       break;
 
     case 0x41:    // Bat 1 voltage as read by ATTiny ADC0, lsb = 5mV 
@@ -851,21 +885,28 @@ void DataRequest()
     case 0x58:
       sendData = probe3 >> 8;
       break;
+    case 0x59:
+      sendData = probe3 & 0xFF;
+      break;
+    case 0x5A:
+      sendData = probe3 >> 8;
+      break;
 
     // debug stuff
     case 0x61:
-      sendData = multi[0];
+      sendData = battPresent[0];
       break;  
     case 0x62:
-      sendData = multi[1];
+      sendData = battPresent[1];
       break;  
     case 0x63:
-      sendData = multi[2];
+      sendData = battPresent[2];
       break;  
     case 0x64:
-      sendData = multi[3];
+      sendData = battPresent[3];
       break;  
-      
+
+
     case 0x70:    // current time
       sendData = currentTime & 0xff;
       break;
@@ -922,9 +963,7 @@ void DataRequest()
         batVoltageATT[n] = 0;
       }
       break;
-      
-      
-        
+             
     default:                // Command Not Recognized
       sendData = CMD_ERROR;   
       break;
